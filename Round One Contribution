@@ -1,0 +1,233 @@
+from datamodel import *
+from collections import deque
+
+class Trader:
+    def __init__(self):
+        self.data = {}
+        
+    def run(self, state):
+        orders = []
+        
+        for product in state.products:
+            listings = Listing(state.orderbook[product], product)
+            
+            if not listings.buy_orders or not listings.sell_orders:
+                continue
+            
+            # Initialize product tracking
+            if product not in self.data:
+                self.data[product] = {
+                    'prices': deque(maxlen=100),
+                    'returns': deque(maxlen=50),
+                    'position': 0,
+                    'trades': 0,
+                    'learning_phase': True,
+                    'mean_reversion_score': 0,
+                    'trend_score': 0,
+                    'last_price': None,
+                    'last_trade_tick': -10
+                }
+            
+            d = self.data[product]
+            
+            highest_bid = list(listings.buy_orders.keys())[0]
+            lowest_ask = list(listings.sell_orders.keys())[0]
+            mid_price = (highest_bid + lowest_ask) / 2
+            spread = lowest_ask - highest_bid
+            
+            # Track price and calculate returns
+            d['prices'].append(mid_price)
+            if d['last_price'] is not None:
+                ret = (mid_price - d['last_price']) / d['last_price']
+                d['returns'].append(ret)
+            d['last_price'] = mid_price
+            
+            # LEARNING PHASE: Observe market for 30 ticks before trading
+            if len(d['prices']) < 30:
+                d['learning_phase'] = True
+                continue
+            else:
+                d['learning_phase'] = False
+            
+            # Analyze market behavior to determine strategy
+            if len(d['returns']) >= 20:
+                returns_list = list(d['returns'])
+                
+                # Test for mean reversion: do prices return to mean?
+                prices_list = list(d['prices'])[-30:]
+                mean_price = sum(prices_list) / len(prices_list)
+                
+                # Count how often price crosses the mean
+                crosses = 0
+                for i in range(1, len(prices_list)):
+                    if (prices_list[i-1] > mean_price and prices_list[i] < mean_price) or \
+                       (prices_list[i-1] < mean_price and prices_list[i] > mean_price):
+                        crosses += 1
+                
+                # High crosses = mean reverting
+                d['mean_reversion_score'] = crosses / len(prices_list)
+                
+                # Test for trending: do returns persist?
+                positive_streaks = 0
+                negative_streaks = 0
+                for i in range(1, len(returns_list)):
+                    if returns_list[i] > 0 and returns_list[i-1] > 0:
+                        positive_streaks += 1
+                    elif returns_list[i] < 0 and returns_list[i-1] < 0:
+                        negative_streaks += 1
+                
+                # High streaks = trending
+                d['trend_score'] = (positive_streaks + negative_streaks) / len(returns_list)
+            
+            # Calculate current metrics
+            recent_prices = list(d['prices'])[-50:]
+            mean_price = sum(recent_prices) / len(recent_prices)
+            
+            # Calculate volatility
+            squared_diffs = [(p - mean_price) ** 2 for p in recent_prices]
+            variance = sum(squared_diffs) / len(squared_diffs)
+            std_dev = variance ** 0.5
+            
+            if std_dev < 0.01:
+                std_dev = 0.01
+            
+            # Calculate z-score
+            z_score = (mid_price - mean_price) / std_dev
+            
+            # Position limits
+            max_pos = 20
+            
+            # Track current tick
+            current_tick = len(d['prices'])
+            
+            # ADAPTIVE STRATEGY SELECTION
+            # If mean reverting market (high crosses, low trend persistence)
+            if d['mean_reversion_score'] > 0.3 and d['trend_score'] < 0.4:
+                # MEAN REVERSION MODE
+                threshold = 1.5
+                
+                if z_score > threshold and d['position'] > -max_pos + 3:
+                    # Price too high, sell
+                    size = min(5, max_pos + d['position'] - 3)
+                    orders.append(Order(product, highest_bid, -size))
+                    d['position'] -= size
+                    d['trades'] += 1
+                    d['last_trade_tick'] = current_tick
+                
+                elif z_score < -threshold and d['position'] < max_pos - 3:
+                    # Price too low, buy
+                    size = min(5, max_pos - d['position'] - 3)
+                    orders.append(Order(product, lowest_ask, size))
+                    d['position'] += size
+                    d['trades'] += 1
+                    d['last_trade_tick'] = current_tick
+                
+                # AMPLIFY IMPROVEMENT 1: More aggressive mean reversion exits
+                # Exit at multiple z-score levels to capture profit faster
+                if abs(d['position']) > 0 and current_tick - d['last_trade_tick'] >= 2:  # Reduced from 3 to 2
+                    if abs(z_score) < 0.8:  # Increased from 0.5 - exit sooner
+                        if d['position'] > 0:
+                            exit_size = min(4, d['position'])  # Increased from 3
+                            orders.append(Order(product, highest_bid, -exit_size))
+                            d['position'] -= exit_size
+                        elif d['position'] < 0:
+                            exit_size = min(4, abs(d['position']))  # Increased from 3
+                            orders.append(Order(product, lowest_ask, exit_size))
+                            d['position'] += exit_size
+                    
+                    # Additional early exit when z-score crosses zero (maximum mean reversion)
+                    elif abs(z_score) < 0.3:
+                        if d['position'] > 0:
+                            exit_size = min(d['position'], 3)
+                            orders.append(Order(product, highest_bid, -exit_size))
+                            d['position'] -= exit_size
+                        elif d['position'] < 0:
+                            exit_size = min(abs(d['position']), 3)
+                            orders.append(Order(product, lowest_ask, exit_size))
+                            d['position'] += exit_size
+            
+            # If trending market (low crosses, high trend persistence)
+            elif d['trend_score'] > 0.4 and d['mean_reversion_score'] < 0.3:
+                # TREND FOLLOWING MODE
+                # Calculate short and long moving averages
+                if len(d['prices']) >= 20:
+                    short_ma = sum(list(d['prices'])[-10:]) / 10
+                    long_ma = sum(list(d['prices'])[-20:]) / 20
+                    
+                    # Uptrend: short MA above long MA
+                    if short_ma > long_ma * 1.01 and d['position'] < max_pos - 3:
+                        size = min(5, max_pos - d['position'] - 3)
+                        orders.append(Order(product, lowest_ask, size))
+                        d['position'] += size
+                        d['trades'] += 1
+                    
+                    # Downtrend: short MA below long MA
+                    elif short_ma < long_ma * 0.99 and d['position'] > -max_pos + 3:
+                        size = min(5, max_pos + d['position'] - 3)
+                        orders.append(Order(product, highest_bid, -size))
+                        d['position'] -= size
+                        d['trades'] += 1
+            
+            # Mixed or uncertain market: use conservative approach
+            else:
+                # CONSERVATIVE MODE: Only trade on very strong signals
+                if z_score > 2.5 and d['position'] > -max_pos + 5:
+                    orders.append(Order(product, highest_bid, -3))
+                    d['position'] -= 3
+                    d['trades'] += 1
+                
+                elif z_score < -2.5 and d['position'] < max_pos - 5:
+                    orders.append(Order(product, lowest_ask, 3))
+                    d['position'] += 3
+                    d['trades'] += 1
+            
+            # AMPLIFY IMPROVEMENT 2: More aggressive tiered market making
+            if spread >= 6 and abs(d['position']) < max_pos - 7:
+                # Extra wide spread - take even more
+                if d['position'] < max_pos - 7:
+                    orders.append(Order(product, highest_bid + 1, 4))
+                    d['position'] += 4
+                
+                if d['position'] > -max_pos + 7:
+                    orders.append(Order(product, lowest_ask - 1, -4))
+                    d['position'] -= 4
+            
+            elif spread >= 5 and abs(d['position']) < max_pos - 6:
+                # Very wide spread - take 3 units
+                if d['position'] < max_pos - 6:
+                    orders.append(Order(product, highest_bid + 1, 3))
+                    d['position'] += 3
+                
+                if d['position'] > -max_pos + 6:
+                    orders.append(Order(product, lowest_ask - 1, -3))
+                    d['position'] -= 3
+            
+            elif spread >= 4 and abs(d['position']) < max_pos - 5:
+                # Normal wide spread - take 2 units
+                if d['position'] < max_pos - 5:
+                    orders.append(Order(product, highest_bid + 1, 2))
+                    d['position'] += 2
+                
+                if d['position'] > -max_pos + 5:
+                    orders.append(Order(product, lowest_ask - 1, -2))
+                    d['position'] -= 2
+            
+            # ADDITIONAL: Market make on spread = 3 with smaller size
+            elif spread >= 3 and abs(d['position']) < max_pos - 4:
+                if d['position'] < max_pos - 4:
+                    orders.append(Order(product, highest_bid + 1, 1))
+                    d['position'] += 1
+                
+                if d['position'] > -max_pos + 4:
+                    orders.append(Order(product, lowest_ask - 1, -1))
+                    d['position'] -= 1
+            
+            # Risk management: reduce large positions near limits
+            if d['position'] >= max_pos - 3:
+                orders.append(Order(product, highest_bid, -3))
+                d['position'] -= 3
+            elif d['position'] <= -max_pos + 3:
+                orders.append(Order(product, lowest_ask, 3))
+                d['position'] += 3
+        
+        return orders
