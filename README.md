@@ -4,6 +4,4 @@ This repository will be a record of my contributions and participation within th
 
 Current Uploads: 
 Tutorial Round
-
-TO Be Uploaded: 
 First Round
