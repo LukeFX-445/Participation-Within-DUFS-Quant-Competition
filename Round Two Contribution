@@ -1,0 +1,213 @@
+from datamodel import *
+from collections import deque
+
+class Trader:
+    def __init__(self):
+        self.positions = {"bond1": 0, "bond2": 0, "bond3": 0, "bond4": 0, "ETF1": 0, "ETF2": 0}
+        self.spread_hist = {"ETF1": deque(maxlen=50), "ETF2": deque(maxlen=50)}
+        self.entry_z = 2.2
+        self.exit_z = 0.4
+        self.max_position = 60
+        self.max_component_spread = 4  # Don't trade if any component spread > this
+        
+    def run(self, state):
+        orders = []
+        
+        # Get order books
+        bids, asks = {}, {}
+        spreads = {}
+        for product in self.positions.keys():
+            book = state.orderbook.get(product)
+            if book and book["BUY"] and book["SELL"]:
+                bids[product] = max(book["BUY"].keys())
+                asks[product] = min(book["SELL"].keys())
+                spreads[product] = asks[product] - bids[product]
+        
+        def mid(p):
+            return (bids[p] + asks[p]) / 2 if p in bids and p in asks else None
+        
+        # Trade ETF1: bond1 + bond2 + bond3
+        # IMPROVEMENT #5: Check component liquidity before trading
+        if all(p in bids and p in asks for p in ["bond1", "bond2", "bond3", "ETF1"]):
+            components = ["bond1", "bond2", "bond3"]
+            # Only trade if all components are liquid
+            if all(spreads[comp] <= self.max_component_spread for comp in components):
+                etf_orders = self._trade_etf(
+                    "ETF1",
+                    components,
+                    mid("ETF1"),
+                    sum(mid(p) for p in components),
+                    bids,
+                    asks,
+                    spreads,
+                    bundle_size=1
+                )
+                orders.extend(etf_orders)
+        
+        # Trade ETF2: 0.5 * (bond1 + bond2 + bond4)
+        if all(p in bids and p in asks for p in ["bond1", "bond2", "bond4", "ETF2"]):
+            components = ["bond1", "bond2", "bond4"]
+            # Only trade if all components are liquid
+            if all(spreads[comp] <= self.max_component_spread for comp in components):
+                etf_orders = self._trade_etf(
+                    "ETF2",
+                    components,
+                    mid("ETF2"),
+                    0.5 * sum(mid(p) for p in components),
+                    bids,
+                    asks,
+                    spreads,
+                    bundle_size=2
+                )
+                orders.extend(etf_orders)
+        
+        # Market making with 4 tiers (from 952 - UNCHANGED)
+        for bond in ["bond1", "bond2", "bond3", "bond4"]:
+            if bond in bids and bond in asks:
+                spread = asks[bond] - bids[bond]
+                
+                if spread >= 4 and abs(self.positions[bond]) < 30:
+                    orders.append(Order(bond, bids[bond] + 1, 4))
+                    self.positions[bond] += 4
+                    orders.append(Order(bond, asks[bond] - 1, -4))
+                    self.positions[bond] -= 4
+                
+                elif spread >= 3 and abs(self.positions[bond]) < 25:
+                    orders.append(Order(bond, bids[bond] + 1, 3))
+                    self.positions[bond] += 3
+                    orders.append(Order(bond, asks[bond] - 1, -3))
+                    self.positions[bond] -= 3
+                
+                elif spread >= 2 and abs(self.positions[bond]) < 20:
+                    orders.append(Order(bond, bids[bond] + 1, 2))
+                    self.positions[bond] += 2
+                    orders.append(Order(bond, asks[bond] - 1, -2))
+                    self.positions[bond] -= 2
+        
+        return orders
+    
+    def _trade_etf(self, etf_name, components, etf_price, fair_value, bids, asks, spreads, bundle_size=1):
+        orders = []
+        
+        # Calculate spread
+        spread = etf_price - fair_value
+        self.spread_hist[etf_name].append(spread)
+        
+        # Need history for z-score
+        if len(self.spread_hist[etf_name]) < 15:
+            return orders
+        
+        # Calculate z-score
+        hist = list(self.spread_hist[etf_name])
+        mean = sum(hist) / len(hist)
+        variance = sum((x - mean) ** 2 for x in hist) / len(hist)
+        std = variance ** 0.5
+        
+        if std < 0.001:
+            return orders
+        
+        z_score = (spread - mean) / std
+        current_pos = self.positions[etf_name]
+        
+        etf_spread = spreads[etf_name]
+        
+        # Entry logic with IMPROVEMENT #3: Use passive orders when possible
+        if current_pos == 0:
+            # ETF overpriced - SHORT ETF, LONG basket
+            if z_score > self.entry_z:
+                size = min(bundle_size * 2, self.max_position)
+                
+                # IMPROVEMENT #3: Try to use passive orders if ETF spread is wide
+                if etf_spread >= 2:
+                    # Post at better price inside spread
+                    sell_price = asks[etf_name] - 1
+                    orders.append(Order(etf_name, sell_price, -size))
+                    self.positions[etf_name] -= size
+                else:
+                    # Narrow spread, cross it
+                    orders.append(Order(etf_name, bids[etf_name], -size))
+                    self.positions[etf_name] -= size
+                
+                # Buy components - use passive orders when spread allows
+                for comp in components:
+                    comp_size = size // bundle_size
+                    if spreads[comp] >= 2:
+                        buy_price = bids[comp] + 1
+                        orders.append(Order(comp, buy_price, comp_size))
+                    else:
+                        orders.append(Order(comp, asks[comp], comp_size))
+                    self.positions[comp] += comp_size
+            
+            # ETF underpriced - LONG ETF, SHORT basket
+            elif z_score < -self.entry_z:
+                size = min(bundle_size * 2, self.max_position)
+                
+                # IMPROVEMENT #3: Try to use passive orders if ETF spread is wide
+                if etf_spread >= 2:
+                    # Post at better price inside spread
+                    buy_price = bids[etf_name] + 1
+                    orders.append(Order(etf_name, buy_price, size))
+                    self.positions[etf_name] += size
+                else:
+                    # Narrow spread, cross it
+                    orders.append(Order(etf_name, asks[etf_name], size))
+                    self.positions[etf_name] += size
+                
+                # Sell components - use passive orders when spread allows
+                for comp in components:
+                    comp_size = size // bundle_size
+                    if spreads[comp] >= 2:
+                        sell_price = asks[comp] - 1
+                        orders.append(Order(comp, sell_price, -comp_size))
+                    else:
+                        orders.append(Order(comp, bids[comp], -comp_size))
+                    self.positions[comp] -= comp_size
+        
+        # Exit logic - always use market orders for fast exit (from 952)
+        elif abs(z_score) < self.exit_z:
+            exit_size = abs(current_pos)
+            
+            if current_pos > 0:
+                # Close long: sell ETF, buy back components
+                orders.append(Order(etf_name, bids[etf_name], -exit_size))
+                self.positions[etf_name] = 0
+                
+                for comp in components:
+                    comp_size = exit_size // bundle_size
+                    orders.append(Order(comp, asks[comp], comp_size))
+                    self.positions[comp] += comp_size
+            
+            elif current_pos < 0:
+                # Close short: buy ETF, sell components
+                orders.append(Order(etf_name, asks[etf_name], exit_size))
+                self.positions[etf_name] = 0
+                
+                for comp in components:
+                    comp_size = exit_size // bundle_size
+                    orders.append(Order(comp, bids[comp], -comp_size))
+                    self.positions[comp] -= comp_size
+        
+        # Take partial profits - also use market orders for speed (from 952)
+        elif current_pos != 0:
+            if (current_pos > 0 and z_score < -0.8) or (current_pos < 0 and z_score > 0.8):
+                profit_size = abs(current_pos) // 3
+                if profit_size >= bundle_size:
+                    if current_pos > 0:
+                        orders.append(Order(etf_name, bids[etf_name], -profit_size))
+                        self.positions[etf_name] -= profit_size
+                        
+                        for comp in components:
+                            comp_size = profit_size // bundle_size
+                            orders.append(Order(comp, asks[comp], comp_size))
+                            self.positions[comp] += comp_size
+                    
+                    else:
+                        orders.append(Order(etf_name, asks[etf_name], profit_size))
+                        self.positions[etf_name] += profit_size
+                        
+                        for comp in components:
+                            comp_size = profit_size // bundle_size
+                            orders.append(Order(comp, bids[comp], -comp_size))
+                            self.positions[comp] -= comp_size
+        
+        return orders
