@@ -1,0 +1,199 @@
+from datamodel import *
+from collections import deque
+import math
+
+class Trader:
+    def __init__(self):
+        self.positions = {}
+        self.price_history = {}
+        self.position_limit = 50
+        self.risk_free_rate = 0.05  # 5% annual risk-free rate
+        self.time_to_expiry = 1.0  # 1 year
+        
+    def run(self, state):
+        orders = []
+        
+        # Get all products and categorize them
+        underlying = None
+        calls = {}
+        puts = {}
+        
+        for product in state.products:
+            if product not in self.positions:
+                self.positions[product] = 0
+            if product not in self.price_history:
+                self.price_history[product] = deque(maxlen=50)
+            
+            # Categorize products
+            if "Call" in product:
+                # Extract strike from product name
+                strike = self._extract_strike(product)
+                if strike:
+                    calls[strike] = product
+            elif "Put" in product:
+                strike = self._extract_strike(product)
+                if strike:
+                    puts[strike] = product
+            else:
+                # Assume it's the underlying
+                underlying = product
+        
+        if not underlying:
+            return orders
+        
+        # Get underlying price
+        underlying_book = state.orderbook.get(underlying)
+        if not underlying_book or not underlying_book["BUY"] or not underlying_book["SELL"]:
+            return orders
+        
+        underlying_bid = max(underlying_book["BUY"].keys())
+        underlying_ask = min(underlying_book["SELL"].keys())
+        underlying_mid = (underlying_bid + underlying_ask) / 2
+        
+        self.price_history[underlying].append(underlying_mid)
+        
+        # Calculate implied volatility from recent price moves
+        if len(self.price_history[underlying]) >= 20:
+            returns = []
+            prices = list(self.price_history[underlying])
+            for i in range(1, len(prices)):
+                ret = (prices[i] - prices[i-1]) / prices[i-1]
+                returns.append(ret)
+            
+            # Annualized volatility
+            if returns:
+                variance = sum(r**2 for r in returns) / len(returns)
+                daily_vol = variance ** 0.5
+                self.implied_vol = daily_vol * (252 ** 0.5)  # Annualize
+            else:
+                self.implied_vol = 0.3  # Default 30%
+        else:
+            self.implied_vol = 0.3
+        
+        # STRATEGY 1: Put-Call Parity Arbitrage
+        # C - P = S - K * e^(-rT)
+        for strike in calls.keys():
+            if strike in puts:
+                call_name = calls[strike]
+                put_name = puts[strike]
+                
+                call_book = state.orderbook.get(call_name)
+                put_book = state.orderbook.get(put_name)
+                
+                if (call_book and call_book["BUY"] and call_book["SELL"] and
+                    put_book and put_book["BUY"] and put_book["SELL"]):
+                    
+                    call_bid = max(call_book["BUY"].keys())
+                    call_ask = min(call_book["SELL"].keys())
+                    put_bid = max(put_book["BUY"].keys())
+                    put_ask = min(put_book["SELL"].keys())
+                    
+                    call_mid = (call_bid + call_ask) / 2
+                    put_mid = (put_bid + put_ask) / 2
+                    
+                    # Theoretical relationship
+                    pv_strike = strike * math.exp(-self.risk_free_rate * self.time_to_expiry)
+                    theoretical_diff = underlying_mid - pv_strike
+                    actual_diff = call_mid - put_mid
+                    
+                    arb_opportunity = actual_diff - theoretical_diff
+                    
+                    # If call is overpriced relative to put
+                    if arb_opportunity > 2 and abs(self.positions[call_name]) < self.position_limit // 2:
+                        # Sell call, buy put, buy underlying
+                        orders.append(Order(call_name, call_bid, -2))
+                        self.positions[call_name] -= 2
+                        
+                        orders.append(Order(put_name, put_ask, 2))
+                        self.positions[put_name] += 2
+                        
+                        orders.append(Order(underlying, underlying_ask, 2))
+                        self.positions[underlying] += 2
+                    
+                    # If put is overpriced relative to call
+                    elif arb_opportunity < -2 and abs(self.positions[put_name]) < self.position_limit // 2:
+                        # Buy call, sell put, sell underlying
+                        orders.append(Order(call_name, call_ask, 2))
+                        self.positions[call_name] += 2
+                        
+                        orders.append(Order(put_name, put_bid, -2))
+                        self.positions[put_name] -= 2
+                        
+                        orders.append(Order(underlying, underlying_bid, -2))
+                        self.positions[underlying] -= 2
+        
+        # STRATEGY 2: Market Making on Options
+        for strike, call_name in calls.items():
+            call_book = state.orderbook.get(call_name)
+            if call_book and call_book["BUY"] and call_book["SELL"]:
+                call_bid = max(call_book["BUY"].keys())
+                call_ask = min(call_book["SELL"].keys())
+                spread = call_ask - call_bid
+                
+                if spread >= 2 and abs(self.positions[call_name]) < self.position_limit // 3:
+                    # Place orders inside spread
+                    orders.append(Order(call_name, call_bid + 1, 1))
+                    self.positions[call_name] += 1
+                    
+                    orders.append(Order(call_name, call_ask - 1, -1))
+                    self.positions[call_name] -= 1
+        
+        for strike, put_name in puts.items():
+            put_book = state.orderbook.get(put_name)
+            if put_book and put_book["BUY"] and put_book["SELL"]:
+                put_bid = max(put_book["BUY"].keys())
+                put_ask = min(put_book["SELL"].keys())
+                spread = put_ask - put_bid
+                
+                if spread >= 2 and abs(self.positions[put_name]) < self.position_limit // 3:
+                    # Place orders inside spread
+                    orders.append(Order(put_name, put_bid + 1, 1))
+                    self.positions[put_name] += 1
+                    
+                    orders.append(Order(put_name, put_ask - 1, -1))
+                    self.positions[put_name] -= 1
+        
+        # STRATEGY 3: Market making on underlying
+        if underlying_book:
+            spread = underlying_ask - underlying_bid
+            if spread >= 2 and abs(self.positions[underlying]) < self.position_limit // 3:
+                orders.append(Order(underlying, underlying_bid + 1, 2))
+                self.positions[underlying] += 2
+                
+                orders.append(Order(underlying, underlying_ask - 1, -2))
+                self.positions[underlying] -= 2
+        
+        return orders
+    
+    def _extract_strike(self, product_name):
+        """Extract strike price from option name"""
+        # Assumes format like "Call_100" or "Put_105"
+        try:
+            parts = product_name.split("_")
+            if len(parts) >= 2:
+                return float(parts[-1])
+        except:
+            pass
+        return None
+    
+    def _black_scholes_call(self, S, K, T, r, sigma):
+        """Black-Scholes formula for European call option"""
+        if T <= 0 or sigma <= 0:
+            return max(S - K, 0)
+        
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        
+        # Approximation of cumulative normal distribution
+        N_d1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+        N_d2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+        
+        call_price = S * N_d1 - K * math.exp(-r * T) * N_d2
+        return call_price
+    
+    def _black_scholes_put(self, S, K, T, r, sigma):
+        """Black-Scholes formula for European put option"""
+        call_price = self._black_scholes_call(S, K, T, r, sigma)
+        # Put-call parity: P = C - S + K*e^(-rT)
+        put_price = call_price - S + K * math.exp(-r * T)
+        return put_price
